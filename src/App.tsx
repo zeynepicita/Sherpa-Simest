@@ -14,18 +14,98 @@ import {
   BarChart3,
   Lightbulb,
   AlertTriangle,
-  Building2
+  Building2,
+  History,
+  LogOut,
+  LogIn,
+  User as UserIcon,
+  Trash2
 } from 'lucide-react';
 import { performAssessment, AssessmentInput } from './services/gemini';
 import Markdown from 'react-markdown';
 import { cn } from './lib/utils';
+import { auth, db, storage, googleProvider } from './firebase';
+import { 
+  signInWithPopup, 
+  signOut, 
+  onAuthStateChanged, 
+  User as FirebaseUser 
+} from 'firebase/auth';
+import { 
+  collection, 
+  addDoc, 
+  getDocs, 
+  query, 
+  where, 
+  orderBy, 
+  serverTimestamp, 
+  doc, 
+  setDoc,
+  deleteDoc,
+  getDocFromServer
+} from 'firebase/firestore';
+import { ref, uploadString, getDownloadURL } from 'firebase/storage';
 
-type Step = 1 | 2 | 3 | 4 | 5;
+type Step = 1 | 2 | 3 | 4 | 5 | 6; // 6 for History
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 export default function App() {
   const [step, setStep] = useState<Step>(1);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [history, setHistory] = useState<any[]>([]);
+  const [uploading, setUploading] = useState<string | null>(null);
 
   const [formData, setFormData] = useState<AssessmentInput>({
     slot1: {
@@ -42,22 +122,133 @@ export default function App() {
       hasCatastrophicPolicy: false,
       coreBusiness: '',
       internationalExperience: '',
+      pdfData: '',
     },
     slot2: {
       totalBudget: 0,
       latamInvestment: 0,
       items: [{ description: '', amount: 0, isLatam: false, category: 'Macchinari e Impianti' }],
+      pdfData: '',
     },
     slot3: {
       sustainabilityImpact: '',
-      dnshCompliance: '',
+      conformityDeclaration: '',
       partnerList: '',
+      pdfData: '',
+      conformityPdf: '',
     },
     slot4: {
       targetCountry: 'Messico',
       marketStrategy: '',
+      pdfData: '',
     },
   });
+
+  React.useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (u) {
+        // Sync user profile
+        const userRef = doc(db, 'users', u.uid);
+        setDoc(userRef, {
+          uid: u.uid,
+          email: u.email,
+          displayName: u.displayName,
+          photoURL: u.photoURL,
+          createdAt: serverTimestamp(),
+          role: 'user'
+        }, { merge: true }).catch(e => handleFirestoreError(e, OperationType.WRITE, `users/${u.uid}`));
+        
+        loadHistory(u.uid);
+      } else {
+        setHistory([]);
+      }
+    });
+
+    // Test connection
+    const testConnection = async () => {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error) {
+        if(error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration. ");
+        }
+      }
+    };
+    testConnection();
+
+    return () => unsubscribe();
+  }, []);
+
+  const loadHistory = async (uid: string) => {
+    const path = `users/${uid}/assessments`;
+    try {
+      const q = query(collection(db, path), orderBy('createdAt', 'desc'));
+      const querySnapshot = await getDocs(q);
+      const docs = querySnapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setHistory(docs);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  };
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error("Login failed", error);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setStep(1);
+      setResult(null);
+    } catch (error) {
+      console.error("Logout failed", error);
+    }
+  };
+
+  const handleFileChange = async (slot: keyof AssessmentInput, field: string, file: File | null) => {
+    if (!file) {
+      handleInputChange(slot, field, '');
+      if (field === 'pdfData') handleInputChange(slot, 'pdfUrl', '');
+      if (field === 'conformityPdf') handleInputChange(slot, 'conformityPdfUrl', '');
+      return;
+    }
+
+    if (!user) {
+      alert("Effettua il login per caricare i file.");
+      return;
+    }
+
+    setUploading(`${slot}-${field}`);
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64 = reader.result as string;
+      handleInputChange(slot, field, base64);
+
+      // Upload to Storage
+      try {
+        const fileExt = file.name.split('.').pop();
+        const fileName = `${slot}_${field}_${Date.now()}.${fileExt}`;
+        const storageRef = ref(storage, `users/${user.uid}/files/${fileName}`);
+        
+        await uploadString(storageRef, base64, 'data_url');
+        const downloadURL = await getDownloadURL(storageRef);
+        
+        const urlField = field === 'conformityPdf' ? 'conformityPdfUrl' : 'pdfUrl';
+        handleInputChange(slot, urlField, downloadURL);
+      } catch (error) {
+        console.error("Upload failed", error);
+        alert("Errore durante il caricamento del file.");
+      } finally {
+        setUploading(null);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
 
   const handleInputChange = (slot: keyof AssessmentInput, field: string, value: any) => {
     setFormData(prev => ({
@@ -98,10 +289,38 @@ export default function App() {
   };
 
   const runAssessment = async () => {
+    if (!user) {
+      alert("Effettua il login per salvare l'analisi.");
+      return;
+    }
+
     setLoading(true);
     try {
       const res = await performAssessment(formData);
       setResult(res);
+      
+      // Save to Firestore
+      const path = `users/${user.uid}/assessments`;
+      try {
+        // Clean formData of Base64 strings for storage (keep URLs)
+        const cleanFormData = JSON.parse(JSON.stringify(formData));
+        Object.keys(cleanFormData).forEach(slot => {
+          delete (cleanFormData as any)[slot].pdfData;
+          delete (cleanFormData as any)[slot].conformityPdf;
+        });
+
+        await addDoc(collection(db, path), {
+          userId: user.uid,
+          formData: cleanFormData,
+          result: res,
+          createdAt: serverTimestamp()
+        });
+        
+        loadHistory(user.uid);
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, path);
+      }
+
       setStep(5);
     } catch (error) {
       console.error(error);
@@ -110,6 +329,40 @@ export default function App() {
       setLoading(false);
     }
   };
+
+  const deleteAssessment = async (id: string) => {
+    if (!user) return;
+    const path = `users/${user.uid}/assessments/${id}`;
+    try {
+      await deleteDoc(doc(db, path));
+      loadHistory(user.uid);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  };
+
+  const FileUpload = ({ slot, field = 'pdfData', label, placeholder }: { slot: keyof AssessmentInput, field?: string, label: string, placeholder?: string }) => (
+    <div className="space-y-2">
+      <label className="text-xs font-bold uppercase tracking-wider text-gray-400">{label}</label>
+      <div className="relative group">
+        <input 
+          type="file" 
+          accept=".pdf"
+          onChange={(e) => handleFileChange(slot, field, e.target.files?.[0] || null)}
+          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+        />
+        <div className={cn(
+          "w-full border-2 border-dashed rounded-lg px-4 py-4 flex flex-col items-center justify-center gap-2 transition-all",
+          (formData[slot] as any)[field] ? "bg-blue-50 border-blue-200 text-blue-600" : "bg-white border-gray-200 text-gray-400 group-hover:border-blue-300 group-hover:text-blue-400"
+        )}>
+          <FileText size={24} />
+          <span className="text-xs font-bold">
+            {(formData[slot] as any)[field] ? "Documento Caricato" : (placeholder || "Carica PDF")}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
 
   const renderStep = () => {
     switch (step) {
@@ -131,6 +384,9 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="md:col-span-2">
+                <FileUpload slot="slot1" label="Documentazione Aziendale (Visura/Bilanci)" />
+              </div>
               <div className="space-y-2">
                 <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Ragione Sociale</label>
                 <input 
@@ -336,6 +592,8 @@ export default function App() {
               </div>
             </div>
 
+            <FileUpload slot="slot2" label="Documentazione Progetto (Preventivi/Piani)" />
+
             <div className="space-y-4">
               {formData.slot2.items.map((item, idx) => (
                 <div key={idx} className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end p-4 bg-white border border-gray-100 rounded-xl shadow-sm">
@@ -427,10 +685,12 @@ export default function App() {
                 <Leaf size={24} />
               </div>
               <div>
-                <h2 className="text-xl font-bold text-gray-900">SLOT 3: Sostenibilità e DNSH</h2>
+                <h2 className="text-xl font-bold text-gray-900">SLOT 3: Sostenibilità e Dichiarazione di Conformità</h2>
                 <p className="text-sm text-gray-500 italic">Relazione Tecnica Impatto</p>
               </div>
             </div>
+
+            <FileUpload slot="slot3" label="Documentazione Tecnica (Certificazioni/Relazioni)" />
 
             <div className="space-y-6">
               <div className="space-y-2">
@@ -452,12 +712,11 @@ export default function App() {
                 />
               </div>
               <div className="space-y-2">
-                <label className="text-xs font-bold uppercase tracking-wider text-gray-400">Conformità DNSH</label>
-                <textarea 
-                  className="w-full bg-white border border-gray-200 rounded-lg px-4 py-3 focus:ring-2 focus:ring-green-500 outline-none transition-all h-32"
-                  placeholder="Dichiara come il progetto non arreca danno significativo agli obiettivi ambientali..."
-                  value={formData.slot3.dnshCompliance}
-                  onChange={(e) => handleInputChange('slot3', 'dnshCompliance', e.target.value)}
+                <FileUpload 
+                  slot="slot3" 
+                  field="conformityPdf" 
+                  label="Dichiarazione di Conformità (PDF)" 
+                  placeholder="Carica la Dichiarazione di Conformità firmata"
                 />
               </div>
             </div>
@@ -479,6 +738,8 @@ export default function App() {
                 <p className="text-sm text-gray-500 italic">Focus America Latina</p>
               </div>
             </div>
+
+            <FileUpload slot="slot4" label="Documentazione Strategica (Ricerche/Piani)" />
 
             <div className="space-y-6">
               <div className="space-y-2">
@@ -688,6 +949,82 @@ export default function App() {
             </div>
           </motion.div>
         );
+      case 6:
+        return (
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="space-y-6"
+          >
+            <div className="flex items-center justify-between mb-8">
+              <div className="flex items-center gap-3">
+                <div className="p-3 bg-gray-100 rounded-xl text-gray-600">
+                  <History size={24} />
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-gray-900">Storico Assessment</h2>
+                  <p className="text-sm text-gray-500 italic">Le tue analisi salvate</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setStep(1)}
+                className="px-4 py-2 bg-gray-900 text-white rounded-lg text-xs font-bold uppercase tracking-widest hover:bg-gray-800 transition-all"
+              >
+                Nuovo Assessment
+              </button>
+            </div>
+
+            {history.length === 0 ? (
+              <div className="bg-white p-12 rounded-3xl border border-gray-100 text-center space-y-4">
+                <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mx-auto text-gray-300">
+                  <History size={32} />
+                </div>
+                <p className="text-gray-500 font-medium">Nessun assessment salvato trovato.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-4">
+                {history.map((item) => (
+                  <div key={item.id} className="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm hover:shadow-md transition-all flex items-center justify-between group">
+                    <div className="flex items-center gap-4">
+                      <div className={cn(
+                        "w-12 h-12 rounded-xl flex items-center justify-center font-black text-lg",
+                        item.result.readinessScore > 70 ? "bg-green-50 text-green-600" : item.result.readinessScore > 40 ? "bg-orange-50 text-orange-600" : "bg-red-50 text-red-600"
+                      )}>
+                        {item.result.readinessScore}
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-gray-900">{item.formData.slot1.companyName || 'Azienda senza nome'}</h3>
+                        <p className="text-xs text-gray-400 font-medium">
+                          {item.createdAt?.toDate ? item.createdAt.toDate().toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Data non disponibile'}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button 
+                        onClick={() => {
+                          setFormData(item.formData);
+                          setResult(item.result);
+                          setStep(5);
+                        }}
+                        className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
+                        title="Visualizza Report"
+                      >
+                        <BarChart3 size={20} />
+                      </button>
+                      <button 
+                        onClick={() => deleteAssessment(item.id)}
+                        className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all opacity-0 group-hover:opacity-100"
+                        title="Elimina"
+                      >
+                        <Trash2 size={20} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </motion.div>
+        );
     }
   };
 
@@ -697,7 +1034,12 @@ export default function App() {
       <header className="bg-white border-b border-gray-100 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <div className="w-10 h-10 bg-orange-600 rounded-xl flex items-center justify-center text-white font-black italic text-xl">S</div>
+            <img 
+              src="https://i.postimg.cc/FsR0f6DN/Screenshot-2026-04-02-at-15-21-54.png" 
+              alt="Sherpa Logo" 
+              className="h-12 object-contain" 
+              referrerPolicy="no-referrer" 
+            />
             <div>
               <h1 className="text-lg font-black tracking-tight leading-none">SHERPA <span className="text-orange-600">SIMEST</span></h1>
               <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Pre-Assessment Tool v1.0</p>
@@ -720,20 +1062,48 @@ export default function App() {
                   {s}
                 </span>
                 <span className="text-[10px] font-black uppercase tracking-widest">
-                  {s === 1 ? 'Identità' : s === 2 ? 'Budget' : s === 3 ? 'DNSH' : 'Mercato'}
+                  {s === 1 ? 'Identità' : s === 2 ? 'Budget' : s === 3 ? 'Conformità' : 'Mercato'}
                 </span>
               </div>
             ))}
           </div>
 
           <div className="flex items-center gap-3">
-            <div className="text-right hidden sm:block">
-              <p className="text-[10px] font-bold text-gray-400 uppercase">Analista Senior</p>
-              <p className="text-xs font-bold">Sherpa Srl</p>
-            </div>
-            <div className="w-10 h-10 rounded-full bg-gray-100 border border-gray-200 overflow-hidden">
-              <img src="https://picsum.photos/seed/analyst/100/100" alt="Avatar" referrerPolicy="no-referrer" />
-            </div>
+            {user ? (
+              <div className="flex items-center gap-3">
+                <button 
+                  onClick={() => setStep(6)}
+                  className={cn(
+                    "p-2 rounded-lg transition-all",
+                    step === 6 ? "bg-gray-100 text-gray-900" : "text-gray-400 hover:text-gray-600"
+                  )}
+                  title="Storico"
+                >
+                  <History size={20} />
+                </button>
+                <div className="text-right hidden sm:block">
+                  <p className="text-[10px] font-bold text-gray-400 uppercase">Benvenuto,</p>
+                  <p className="text-xs font-bold">{user.displayName?.split(' ')[0]}</p>
+                </div>
+                <button 
+                  onClick={handleLogout}
+                  className="w-10 h-10 rounded-full bg-gray-100 border border-gray-200 overflow-hidden group relative"
+                >
+                  <img src={user.photoURL || `https://picsum.photos/seed/${user.uid}/100/100`} alt="Avatar" referrerPolicy="no-referrer" />
+                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all">
+                    <LogOut size={16} className="text-white" />
+                  </div>
+                </button>
+              </div>
+            ) : (
+              <button 
+                onClick={handleLogin}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-900 text-white rounded-xl font-bold text-xs hover:bg-gray-800 transition-all"
+              >
+                <LogIn size={16} />
+                Accedi
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -801,15 +1171,50 @@ export default function App() {
 
       {/* Footer */}
       <footer className="mt-auto py-12 border-t border-gray-100 bg-white">
-        <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-8">
-          <div className="flex items-center gap-4 opacity-50">
-            <div className="w-8 h-8 bg-gray-900 rounded-lg flex items-center justify-center text-white font-black italic text-sm">S</div>
-            <p className="text-[10px] font-bold uppercase tracking-widest">Sherpa Srl © 2026</p>
+        <div className="max-w-7xl mx-auto px-6 flex flex-col items-center gap-12">
+          {/* Banner Loghi Partner */}
+          <div className="w-full flex justify-center">
+            <img 
+              src="https://i.postimg.cc/85RmHrrX/Screenshot-2026-04-02-at-15-20-26.png" 
+              alt="Sherpa, Università di Padova, SIMEST Partners" 
+              className="h-24 md:h-32 object-contain opacity-100 transition-opacity"
+              referrerPolicy="no-referrer"
+            />
           </div>
-          <div className="flex gap-8">
-            <a href="#" className="text-[10px] font-bold text-gray-400 uppercase hover:text-orange-600 transition-all">Circolare SIMEST 1/394/2025</a>
-            <a href="#" className="text-[10px] font-bold text-gray-400 uppercase hover:text-orange-600 transition-all">Metodo 6A</a>
-            <a href="#" className="text-[10px] font-bold text-gray-400 uppercase hover:text-orange-600 transition-all">Privacy Policy</a>
+
+          <div className="w-full grid grid-cols-1 md:grid-cols-3 gap-8 pt-8 border-t border-gray-50">
+            {/* Sedi e Dati Societari */}
+            <div className="space-y-2">
+              <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Dati Societari</p>
+              <div className="text-[10px] text-gray-500 space-y-1 font-medium">
+                <p>Sede legale: Via Enrico Degli Scrovegni 2/A 35131 Padova (PD)</p>
+                <p>Sede operativa: Viale dell’industria 21 35129 Padova (PD)</p>
+                <p>P. IVA / C. F. 05053000286</p>
+                <p>Capitale Sociale 10.000,00€</p>
+                <p>PIC: 879405978</p>
+              </div>
+            </div>
+
+            {/* Contatti */}
+            <div className="space-y-2">
+              <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Contatti</p>
+              <div className="text-[10px] text-gray-500 space-y-1 font-medium">
+                <p>Tel +39 335 266572</p>
+                <p>PEC <a href="mailto:sherpasrl@pec.it" className="hover:text-orange-600 transition-all">sherpasrl@pec.it</a></p>
+                <p>e-mail <a href="mailto:info@sherpasrl.it" className="hover:text-orange-600 transition-all">info@sherpasrl.it</a></p>
+              </div>
+            </div>
+
+            {/* Link Legali e Risorse */}
+            <div className="space-y-2 md:text-right">
+              <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Risorse e Legal</p>
+              <div className="flex flex-col gap-2">
+                <a href="https://www.iubenda.com/privacy-policy/65409660" target="_blank" rel="noopener noreferrer" className="text-[10px] font-bold text-gray-500 uppercase hover:text-orange-600 transition-all">Privacy Policy</a>
+                <a href="https://www.iubenda.com/privacy-policy/65409660/cookie-policy" target="_blank" rel="noopener noreferrer" className="text-[10px] font-bold text-gray-500 uppercase hover:text-orange-600 transition-all">Cookie Policy</a>
+                <a href="#" className="text-[10px] font-bold text-gray-500 uppercase hover:text-orange-600 transition-all">Circolare SIMEST 1/394/2025</a>
+                <a href="#" className="text-[10px] font-bold text-gray-500 uppercase hover:text-orange-600 transition-all">Metodo 6A</a>
+              </div>
+            </div>
           </div>
         </div>
       </footer>

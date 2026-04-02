@@ -1,10 +1,11 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
 const SYSTEM_INSTRUCTION = `
-RUOLO: Sei il "Sherpa Strategic Engine". Il tuo compito è analizzare i dati forniti (Core Business, Esperienza Internazionale, Concept della Proposta, Lista Partner) per fornire un’opinione professionale sull’internazionalizzazione in America Latina basata sulla Circolare SIMEST 1/394/2025.
+RUOLO: Sei il "Sherpa Strategic Engine". Il tuo compito è analizzare i dati forniti (Core Business, Esperienza Internazionale, Concept della Proposta, Lista Partner) E i documenti PDF caricati (Concept, CV, Partner List, Visure) per fornire un’opinione professionale sull’internazionalizzazione in America Latina basata sulla Circolare SIMEST 1/394/2025.
 
 FASE 1: ANALISI DOCUMENTALE (INPUT)
-- Core Business & Esperienza: Estrai il core business e verifica l'esperienza internazionale pregressa.
+- Analizza i PDF caricati per estrarre informazioni chiave.
+- Core Business & Esperienza: Estrai il core business e verifica l'esperienza internazionale pregressa dai documenti.
 - Concept della Proposta: Identifica il Paese Target e il prodotto/servizio specifico (Slot 4).
 - Lista Partner (Slot 3): Valuta la "Generatività" (Sherpa 6A). I partner locali sono solo distributori o creano un "Ecosistema di Innovazione"?
 
@@ -62,31 +63,63 @@ export interface AssessmentInput {
     hasCatastrophicPolicy: boolean;
     coreBusiness: string;
     internationalExperience: string;
+    pdfData?: string; // Base64 encoded PDF for AI
+    pdfUrl?: string; // Storage URL for saving
   };
   slot2: {
     totalBudget: number;
     latamInvestment: number;
     items: { description: string; amount: number; isLatam: boolean; category: string }[];
+    pdfData?: string; // Base64 encoded PDF for AI
+    pdfUrl?: string; // Storage URL for saving
   };
   slot3: {
     sustainabilityImpact: string;
-    dnshCompliance: string;
+    conformityDeclaration: string; 
     partnerList: string;
+    pdfData?: string; 
+    conformityPdf?: string; 
+    conformityPdfUrl?: string; // Storage URL for saving
+    pdfUrl?: string; // Storage URL for saving
   };
   slot4: {
     targetCountry: string;
     marketStrategy: string;
+    pdfData?: string; 
+    pdfUrl?: string; // Storage URL for saving
   };
 }
 
 export async function performAssessment(input: AssessmentInput) {
   const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+  
+  const parts: any[] = [
+    { text: `Ecco i dati per il pre-assessment: ${JSON.stringify(input)}` }
+  ];
+
+  // Add PDFs if present
+  if (input.slot1.pdfData) {
+    parts.push({ inlineData: { data: input.slot1.pdfData.split(',')[1], mimeType: "application/pdf" } });
+  }
+  if (input.slot2.pdfData) {
+    parts.push({ inlineData: { data: input.slot2.pdfData.split(',')[1], mimeType: "application/pdf" } });
+  }
+  if (input.slot3.pdfData) {
+    parts.push({ inlineData: { data: input.slot3.pdfData.split(',')[1], mimeType: "application/pdf" } });
+  }
+  if (input.slot3.conformityPdf) {
+    parts.push({ inlineData: { data: input.slot3.conformityPdf.split(',')[1], mimeType: "application/pdf" } });
+  }
+  if (input.slot4.pdfData) {
+    parts.push({ inlineData: { data: input.slot4.pdfData.split(',')[1], mimeType: "application/pdf" } });
+  }
+
   const model = genAI.models.generateContent({
     model: "gemini-3.1-pro-preview",
     contents: [
       {
         role: "user",
-        parts: [{ text: `Ecco i dati per il pre-assessment: ${JSON.stringify(input)}` }]
+        parts: parts
       }
     ],
     config: {

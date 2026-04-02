@@ -1,0 +1,39 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Assessment": {
+      "title": "Assessment",
+      "description": "SIMEST Pre-Assessment record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "formData": { "type": "object" },
+        "result": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "formData", "result", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/users/{userId}/assessments/{assessmentId}": {
+      "schema": "Assessment",
+      "description": "User's SIMEST assessments"
+    }
+  }
+}
